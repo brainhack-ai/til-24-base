@@ -5,19 +5,30 @@ from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, Trainer, TrainingArg
 from pathlib import Path
 import torch
 import librosa
+import io
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
 
 class ASRManager:
     def __init__(self):
         # initialize the model here
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
         # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model_name = 'facebook/wav2vec2-large-960h'
+        model_name = 'facebook/wav2vec2-large-robust-ft-swbd-300h'
         self.processor = Wav2Vec2Processor.from_pretrained(model_name)
-        self.model = Wav2Vec2ForCTC.from_pretrained(model_name)
+        self.model = Wav2Vec2ForCTC.from_pretrained(model_name).to(self.device)
         self.data_dir = Path("data")
 
         data = {'key': [], 'audio': [], 'transcript': []}
         with jsonlines.open(self.data_dir / "asr.jsonl") as reader:
             for obj in reader:
+                if (len(data['key']) > 10):
+                    break
                 for key, value in obj.items():
                     data[key].append(value)
 
@@ -42,7 +53,7 @@ class ASRManager:
             evaluation_strategy="steps",
             learning_rate=1e-4,
             per_device_train_batch_size=1,
-            num_train_epochs=3,
+            num_train_epochs=2,
             weight_decay=0.005,
             save_steps=500,
             eval_steps=500,
@@ -50,7 +61,7 @@ class ASRManager:
             load_best_model_at_end=True
         )
 
-        trainer = Trainer(
+        self.trainer = Trainer(
             model=self.model,
             args=training_args,
             train_dataset=train_dataset,
@@ -58,13 +69,14 @@ class ASRManager:
             tokenizer=self.processor.feature_extractor
         )
 
-        trainer.train()
+        self.trainer.train()
 
 
 
     def transcribe(self, audio_bytes: bytes) -> str:
-        audio_input, sample_rate = librosa.load(audio_bytes, sr=16000)
-        input_values = self.processor(audio_input, sampling_rate=sample_rate, return_tensors="pt").input_values
+        waveform, sample_rate = torchaudio.load(io.BytesIO(audio_bytes))
+        waveform = waveform.to(self.device)
+        input_values = self.processor(waveform.squeeze(0), sampling_rate=sample_rate, return_tensors="pt").input_values.to(self.device)
 
 
         with torch.no_grad():
@@ -81,6 +93,7 @@ class ASRManager:
 
         for audio_path, transcript in zip(examples['audio'], examples['transcript']):
             speech_array, sampling_rate = torchaudio.load(self.data_dir / 'audio' / audio_path)
+            speech_array = speech_array.squeeze(0)
             processed = self.processor(speech_array.squeeze(0), sampling_rate=sampling_rate, return_tensors="pt", padding=True)
 
             with self.processor.as_target_processor():
@@ -101,3 +114,18 @@ class ASRManager:
         examples['labels'] = torch.stack(labels)
 
         return examples
+
+def main():
+    asr_manager = ASRManager()
+
+
+    file_path = "data/audio/audio_2.wav"
+    with open(file_path, 'rb') as f:
+        audio_bytes = f.read()
+    transcription = asr_manager.transcribe(audio_bytes)
+    print("Transcription: ", transcription)
+
+
+
+if __name__ == "__main__":
+    main()
